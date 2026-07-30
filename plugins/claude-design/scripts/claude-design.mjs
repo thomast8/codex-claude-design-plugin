@@ -2,12 +2,13 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 export const DESIGN_CLIENT_ID = "59637612-477b-4836-a601-b0589eda7704";
 export const SCOPES = ["user:design:read", "user:design:write"];
@@ -89,7 +90,7 @@ async function requestTokens(body, label) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "User-Agent": "codex-claude-design/0.4.0",
+      "User-Agent": "codex-claude-design/0.4.1",
     },
     body: JSON.stringify(body),
   });
@@ -444,7 +445,7 @@ async function main() {
 
 const isMain =
   process.argv[1] &&
-  pathToFileURL(process.argv[1]).href === import.meta.url;
+  realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMain) {
   main().catch((error) => {
