@@ -1,6 +1,7 @@
 # Claude Design for Codex
 
-A Codex plugin for working with live Claude Design projects and prototypes.
+A Codex plugin for working with and exporting live Claude Design projects and
+prototypes.
 
 Anthropic's Claude Design OAuth client uses a manual-code callback that is not
 compatible with Codex's standard localhost MCP callback. This plugin bridges
@@ -24,6 +25,24 @@ codex plugin add claude-design@claude-design
 ```
 
 Start a new task after installation so Codex loads the plugin.
+
+## Connector behaviour
+
+When Claude Design is explicitly named, the plugin keeps the request on the
+Claude Design connector. Verbs such as “open”, “read”, “download”, and “export”
+do not route the task to a browser. Browser tooling is used only when requested
+or for visual QA of the connector's short-lived preview URL.
+
+The bridge adds two local tools to Anthropic's MCP surface:
+
+- `download_file_to_local` downloads one project file as exact raw bytes,
+  including PNG, JPEG, GIF, WebP, fonts, PDFs, and other binary assets.
+- `export_project_to_local` creates a complete standalone local directory and
+  a `.claude-design-export.json` manifest containing source etags, byte counts,
+  content types, and SHA-256 hashes.
+
+Both tools require a new absolute destination under the user's home or
+temporary directory and refuse to overwrite existing paths.
 
 ## First-use authentication
 

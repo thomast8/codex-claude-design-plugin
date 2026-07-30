@@ -3,11 +3,27 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import {
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 export const DESIGN_CLIENT_ID = "59637612-477b-4836-a601-b0589eda7704";
@@ -24,7 +40,60 @@ export const STORE_PATH =
 const REFRESH_SKEW_MS = 60_000;
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
 const MCP_REMOTE_VERSION = "0.1.37";
+const MAX_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_EXPORT_BYTES = 512 * 1024 * 1024;
+const MAX_EXPORT_FILES = 20_000;
+const EXPORT_MANIFEST = ".claude-design-export.json";
 const require = createRequire(import.meta.url);
+
+export const LOCAL_TOOLS = [
+  {
+    name: "download_file_to_local",
+    description:
+      "Download one Claude Design project file to a new local path as exact raw bytes. Works for binary assets such as PNG, JPEG, GIF, WebP, fonts, PDFs, and archives as well as text. The destination must be an absolute path under the user's home or temporary directory and must not already exist.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["project_id", "path", "output_path"],
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Claude Design project ID.",
+        },
+        path: {
+          type: "string",
+          description: "Project-relative file path.",
+        },
+        output_path: {
+          type: "string",
+          description:
+            "Absolute destination file path. Existing files are never overwritten.",
+        },
+      },
+    },
+  },
+  {
+    name: "export_project_to_local",
+    description:
+      "Export every file in a Claude Design project to a new local directory as exact raw bytes, including binary assets that read_file cannot return. Preserves project-relative paths and writes .claude-design-export.json with source etags, sizes, content types, and SHA-256 hashes. The destination directory must not already exist.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["project_id", "output_dir"],
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Claude Design project ID.",
+        },
+        output_dir: {
+          type: "string",
+          description:
+            "Absolute destination directory under the user's home or temporary directory. It must not already exist.",
+        },
+      },
+    },
+  },
+];
 
 function base64Url(value) {
   return Buffer.from(value)
@@ -90,7 +159,7 @@ async function requestTokens(body, label) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "User-Agent": "codex-claude-design/0.4.1",
+      "User-Agent": "codex-claude-design/0.5.0",
     },
     body: JSON.stringify(body),
   });
@@ -357,6 +426,400 @@ export async function logout() {
   console.log(`Removed ${STORE_PATH}`);
 }
 
+function isPathInside(root, target) {
+  const pathFromRoot = relative(root, target);
+  return (
+    pathFromRoot === "" ||
+    (pathFromRoot !== ".." &&
+      !pathFromRoot.startsWith(`..${sep}`) &&
+      !isAbsolute(pathFromRoot))
+  );
+}
+
+async function allowedOutputRoots() {
+  const roots = [homedir(), tmpdir(), "/private/tmp"];
+  const resolvedRoots = [];
+  for (const root of roots) {
+    try {
+      resolvedRoots.push(await realpath(root));
+    } catch {
+      resolvedRoots.push(resolve(root));
+    }
+  }
+  return [...new Set(resolvedRoots)];
+}
+
+async function nearestExistingAncestor(target) {
+  let candidate = target;
+  while (true) {
+    try {
+      await lstat(candidate);
+      return candidate;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) throw error;
+      candidate = parent;
+    }
+  }
+}
+
+async function validateNewLocalPath(target, label) {
+  if (typeof target !== "string" || !isAbsolute(target)) {
+    throw new Error(`${label} must be an absolute path.`);
+  }
+  const resolvedTarget = resolve(target);
+  const roots = await allowedOutputRoots();
+  if (!roots.some((root) => isPathInside(root, resolvedTarget))) {
+    throw new Error(
+      `${label} must be inside the user's home or temporary directory.`,
+    );
+  }
+  try {
+    await lstat(resolvedTarget);
+    throw new Error(`${label} already exists; refusing to overwrite it.`);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const ancestor = await nearestExistingAncestor(dirname(resolvedTarget));
+  const realAncestor = await realpath(ancestor);
+  if (!roots.some((root) => isPathInside(root, realAncestor))) {
+    throw new Error(`${label} resolves outside the permitted output roots.`);
+  }
+  return resolvedTarget;
+}
+
+export function validateRemoteFilePath(path) {
+  if (
+    typeof path !== "string" ||
+    path.length === 0 ||
+    path.includes("\0") ||
+    path.includes("\\") ||
+    path.startsWith("/")
+  ) {
+    throw new Error("Project paths must be non-empty relative POSIX paths.");
+  }
+  const segments = path.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error("Project paths cannot contain empty, '.' or '..' segments.");
+  }
+  return path;
+}
+
+function validateProjectId(projectId) {
+  if (
+    typeof projectId !== "string" ||
+    !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(projectId)
+  ) {
+    throw new Error("project_id must be a Claude Design project UUID.");
+  }
+  return projectId;
+}
+
+function validateServeUrl(rawUrl) {
+  const url = new URL(rawUrl);
+  if (
+    url.protocol !== "https:" ||
+    !url.hostname.endsWith(".claudeusercontent.com")
+  ) {
+    throw new Error("Claude Design returned an unexpected asset host.");
+  }
+  if (!url.searchParams.has("t")) {
+    throw new Error("Claude Design returned an asset URL without a token.");
+  }
+  return url;
+}
+
+export function buildProjectFileUrl(serveUrl, path) {
+  const safePath = validateRemoteFilePath(path);
+  const base = validateServeUrl(serveUrl);
+  const marker = "/serve/";
+  const markerIndex = base.pathname.indexOf(marker);
+  if (markerIndex < 0) {
+    throw new Error("Claude Design returned an unexpected asset URL.");
+  }
+  const prefix = base.pathname.slice(0, markerIndex + marker.length);
+  const encodedPath = safePath
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return new URL(`${base.origin}${prefix}${encodedPath}${base.search}`);
+}
+
+function parseToolPayload(result, toolName) {
+  if (result?.isError) {
+    throw new Error(`${toolName} failed.`);
+  }
+  const text = (result?.content || []).find((item) => item.type === "text")?.text;
+  if (!text) throw new Error(`${toolName} returned no JSON payload.`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${toolName} returned an invalid JSON payload.`);
+  }
+}
+
+export function decodeReadFilePayload(payload, expectedPath, expectedEtag) {
+  const firstLineEnd = payload.indexOf("\n");
+  const closingMarker = "\n</untrusted-project-content>";
+  const closingIndex = payload.indexOf(closingMarker);
+  if (firstLineEnd < 0 || closingIndex < firstLineEnd) {
+    throw new Error("read_file returned an unexpected wrapper.");
+  }
+  const openingTag = payload.slice(0, firstLineEnd);
+  const pathMatch = openingTag.match(/\spath="([^"]*)"/);
+  const etagMatch = openingTag.match(/\setag="([^"]*)"/);
+  const decodedPath = pathMatch
+    ? pathMatch[1]
+        .replaceAll("&quot;", '"')
+        .replaceAll("&lt;", "<")
+        .replaceAll("&gt;", ">")
+        .replaceAll("&amp;", "&")
+    : null;
+  if (decodedPath !== expectedPath) {
+    throw new Error("read_file returned a different project path.");
+  }
+  if (expectedEtag && (!etagMatch || etagMatch[1] !== String(expectedEtag))) {
+    throw new Error("read_file etag did not match list_files.");
+  }
+  const escaped = payload.slice(firstLineEnd + 1, closingIndex);
+  return escaped
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+}
+
+async function readProjectTextFile(callRemoteTool, projectId, file) {
+  const result = await callRemoteTool("read_file", {
+    project_id: projectId,
+    path: file.path,
+  });
+  if (result?.isError) return null;
+  const payload = (result?.content || []).find(
+    (item) => item.type === "text",
+  )?.text;
+  if (!payload) throw new Error(`read_file returned no content for ${file.path}.`);
+  const decoded = decodeReadFilePayload(payload, file.path, file.etag);
+  const bytes = Buffer.from(decoded, "utf8");
+  if (bytes.length !== file.size) {
+    return null;
+  }
+  return {
+    bytes,
+    contentType: "text/plain",
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    source: "read_file",
+  };
+}
+
+async function fetchProjectAsset(url, expectedSize) {
+  const response = await fetch(url, {
+    redirect: "error",
+    headers: { "User-Agent": "codex-claude-design/0.5.0" },
+  });
+  if (!response.ok) {
+    throw new Error(`Project file download failed (${response.status}).`);
+  }
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (declaredLength && declaredLength > MAX_FILE_BYTES) {
+    throw new Error(`Project file exceeds the ${MAX_FILE_BYTES} byte limit.`);
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > MAX_FILE_BYTES) {
+    throw new Error(`Project file exceeds the ${MAX_FILE_BYTES} byte limit.`);
+  }
+  if (Number.isFinite(expectedSize) && bytes.length !== expectedSize) {
+    throw new Error(
+      `Downloaded ${bytes.length} bytes but Claude Design listed ${expectedSize}.`,
+    );
+  }
+  return {
+    bytes,
+    contentType:
+      response.headers.get("content-type")?.split(";")[0] ||
+      "application/octet-stream",
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    source: "render_preview",
+  };
+}
+
+async function downloadProjectFile(callRemoteTool, projectId, file, assetBase) {
+  const textDownload = await readProjectTextFile(
+    callRemoteTool,
+    projectId,
+    file,
+  );
+  if (textDownload) return textDownload;
+  const base =
+    assetBase ||
+    (await projectAssetBase(callRemoteTool, projectId, file.path));
+  return fetchProjectAsset(buildProjectFileUrl(base, file.path), file.size);
+}
+
+async function projectFileIndex(callRemoteTool, projectId) {
+  const listing = parseToolPayload(
+    await callRemoteTool("list_files", {
+      project_id: projectId,
+      path: "",
+      depth: -1,
+    }),
+    "list_files",
+  );
+  if (!Array.isArray(listing)) {
+    throw new Error("list_files returned an unexpected payload.");
+  }
+  const files = listing.filter((entry) => entry?.type === "file");
+  if (files.length === 0) throw new Error("The project contains no files.");
+  if (files.length > MAX_EXPORT_FILES) {
+    throw new Error(`The project exceeds the ${MAX_EXPORT_FILES} file limit.`);
+  }
+  let totalBytes = 0;
+  for (const file of files) {
+    validateRemoteFilePath(file.path);
+    if (!Number.isSafeInteger(file.size) || file.size < 0) {
+      throw new Error(`Claude Design returned an invalid size for ${file.path}.`);
+    }
+    if (file.size > MAX_FILE_BYTES) {
+      throw new Error(`${file.path} exceeds the ${MAX_FILE_BYTES} byte limit.`);
+    }
+    totalBytes += file.size;
+  }
+  if (totalBytes > MAX_EXPORT_BYTES) {
+    throw new Error(`The project exceeds the ${MAX_EXPORT_BYTES} byte limit.`);
+  }
+  return { files, totalBytes };
+}
+
+async function projectAssetBase(callRemoteTool, projectId, firstPath) {
+  const preview = parseToolPayload(
+    await callRemoteTool("render_preview", {
+      project_id: projectId,
+      path: firstPath,
+    }),
+    "render_preview",
+  );
+  if (!preview?.serve_url) {
+    throw new Error("render_preview returned no asset URL.");
+  }
+  return validateServeUrl(preview.serve_url);
+}
+
+async function downloadFileToLocal(arguments_, callRemoteTool) {
+  const { project_id: projectId, path, output_path: outputPath } = arguments_;
+  validateProjectId(projectId);
+  const safePath = validateRemoteFilePath(path);
+  const target = await validateNewLocalPath(outputPath, "output_path");
+  const { files } = await projectFileIndex(callRemoteTool, projectId);
+  const file = files.find((entry) => entry.path === safePath);
+  if (!file) throw new Error(`${safePath} does not exist in the project.`);
+  const downloaded = await downloadProjectFile(
+    callRemoteTool,
+    projectId,
+    file,
+  );
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  await writeFile(target, downloaded.bytes, { flag: "wx", mode: 0o600 });
+  return {
+    project_id: projectId,
+    path: safePath,
+    output_path: target,
+    bytes: downloaded.bytes.length,
+    etag: file.etag,
+    content_type: downloaded.contentType,
+    sha256: downloaded.sha256,
+    source: downloaded.source,
+  };
+}
+
+async function exportProjectToLocal(arguments_, callRemoteTool) {
+  const { project_id: projectId, output_dir: outputDir } = arguments_;
+  validateProjectId(projectId);
+  const targetRoot = await validateNewLocalPath(outputDir, "output_dir");
+  const { files, totalBytes } = await projectFileIndex(
+    callRemoteTool,
+    projectId,
+  );
+  if (files.some((file) => file.path === EXPORT_MANIFEST)) {
+    throw new Error(
+      `The project already contains the reserved path ${EXPORT_MANIFEST}.`,
+    );
+  }
+  await mkdir(targetRoot, { recursive: true, mode: 0o700 });
+
+  const exported = [];
+  let assetBase;
+  for (const file of files) {
+    const localPath = join(targetRoot, ...file.path.split("/"));
+    if (!isPathInside(targetRoot, localPath)) {
+      throw new Error(`Unsafe project path: ${file.path}`);
+    }
+    let downloaded = await readProjectTextFile(callRemoteTool, projectId, file);
+    if (!downloaded) {
+      assetBase ||= await projectAssetBase(
+        callRemoteTool,
+        projectId,
+        file.path,
+      );
+      downloaded = await fetchProjectAsset(
+        buildProjectFileUrl(assetBase, file.path),
+        file.size,
+      );
+    }
+    await mkdir(dirname(localPath), { recursive: true, mode: 0o700 });
+    await writeFile(localPath, downloaded.bytes, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    exported.push({
+      path: file.path,
+      bytes: downloaded.bytes.length,
+      etag: file.etag,
+      content_type: downloaded.contentType,
+      sha256: downloaded.sha256,
+      source: downloaded.source,
+    });
+  }
+
+  const manifestPath = join(targetRoot, EXPORT_MANIFEST);
+  const manifest = {
+    format: "claude-design-local-export.v1",
+    project_id: projectId,
+    exported_at: new Date().toISOString(),
+    source_file_count: exported.length,
+    source_bytes: totalBytes,
+    files: exported,
+  };
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  return {
+    project_id: projectId,
+    output_dir: targetRoot,
+    file_count: exported.length,
+    bytes: totalBytes,
+    manifest_path: manifestPath,
+  };
+}
+
+function localToolResult(payload) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload) }],
+  };
+}
+
+function localToolError(error) {
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text",
+        text: error instanceof Error ? error.message : String(error),
+      },
+    ],
+  };
+}
+
 function resolveMcpRemote() {
   try {
     const packagePath = require.resolve("mcp-remote/package.json");
@@ -369,6 +832,145 @@ function resolveMcpRemote() {
   } catch {
     return null;
   }
+}
+
+function startProtocolProxy(child) {
+  const pending = new Map();
+  let nextInternalId = 1;
+  const childLines = createInterface({ input: child.stdout });
+  const parentLines = createInterface({ input: process.stdin });
+
+  const writeToChild = (message) => {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  };
+  const writeToParent = (message) => {
+    process.stdout.write(`${JSON.stringify(message)}\n`);
+  };
+  const requestRemote = (method, params) =>
+    new Promise((resolveRequest, rejectRequest) => {
+      const id = `claude-design-bridge-${nextInternalId++}`;
+      pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
+      writeToChild({ jsonrpc: "2.0", id, method, params });
+    });
+  const callRemoteTool = (name, arguments_) =>
+    requestRemote("tools/call", { name, arguments: arguments_ });
+
+  childLines.on("line", (line) => {
+    if (!line.trim()) return;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      process.stderr.write("Claude Design bridge ignored non-JSON output.\n");
+      return;
+    }
+    const waiter = pending.get(message.id);
+    if (waiter) {
+      pending.delete(message.id);
+      if (message.error) {
+        waiter.reject(
+          new Error(message.error.message || "Remote MCP request failed."),
+        );
+      } else {
+        waiter.resolve(message.result);
+      }
+      return;
+    }
+    writeToParent(message);
+  });
+
+  parentLines.on("line", async (line) => {
+    if (!line.trim()) return;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      child.stdin.write(`${line}\n`);
+      return;
+    }
+
+    try {
+      if (message.method === "tools/list" && message.id !== undefined) {
+        const result = await requestRemote("tools/list", message.params || {});
+        const remoteTools = Array.isArray(result?.tools) ? result.tools : [];
+        const remoteNames = new Set(remoteTools.map((tool) => tool.name));
+        const collisions = LOCAL_TOOLS.filter((tool) =>
+          remoteNames.has(tool.name),
+        );
+        if (collisions.length > 0) {
+          throw new Error(
+            `Remote tool collision: ${collisions.map((tool) => tool.name).join(", ")}`,
+          );
+        }
+        writeToParent({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { ...result, tools: [...remoteTools, ...LOCAL_TOOLS] },
+        });
+        return;
+      }
+
+      if (
+        message.method === "tools/call" &&
+        message.id !== undefined &&
+        LOCAL_TOOLS.some((tool) => tool.name === message.params?.name)
+      ) {
+        let payload;
+        if (message.params.name === "download_file_to_local") {
+          payload = await downloadFileToLocal(
+            message.params.arguments || {},
+            callRemoteTool,
+          );
+        } else {
+          payload = await exportProjectToLocal(
+            message.params.arguments || {},
+            callRemoteTool,
+          );
+        }
+        writeToParent({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: localToolResult(payload),
+        });
+        return;
+      }
+      writeToChild(message);
+    } catch (error) {
+      if (
+        message.method === "tools/call" &&
+        LOCAL_TOOLS.some((tool) => tool.name === message.params?.name)
+      ) {
+        writeToParent({
+          jsonrpc: "2.0",
+          id: message.id ?? null,
+          result: localToolError(error),
+        });
+      } else {
+        writeToParent({
+          jsonrpc: "2.0",
+          id: message.id ?? null,
+          error: {
+            code: -32603,
+            message: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
+    }
+  });
+
+  const rejectPending = (error) => {
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+  };
+  child.once("error", rejectPending);
+  child.once("exit", () => {
+    rejectPending(new Error("Remote Claude Design MCP stopped."));
+    childLines.close();
+    parentLines.close();
+  });
+  parentLines.once("close", () => {
+    if (!child.stdin.destroyed) child.stdin.end();
+  });
 }
 
 export async function startServer() {
@@ -394,7 +996,7 @@ export async function startServer() {
     ? [localBinary, ...commonArgs]
     : ["-y", `mcp-remote@${MCP_REMOTE_VERSION}`, ...commonArgs];
   const child = spawn(command, args, {
-    stdio: ["inherit", "inherit", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     env: {
       ...process.env,
       CODEX_CLAUDE_DESIGN_ACCESS_TOKEN: accessToken,
@@ -408,6 +1010,7 @@ export async function startServer() {
     );
     process.stderr.write(text);
   });
+  startProtocolProxy(child);
   const stopChild = (signal) => {
     if (!child.killed) child.kill(signal);
   };

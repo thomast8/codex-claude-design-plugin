@@ -3,6 +3,10 @@
 This Codex plugin connects to Anthropic's remote Claude Design MCP through a
 local stdio bridge.
 
+Explicit Claude Design requests stay on this connector. The bridge adds exact
+raw `download_file_to_local` and complete `export_project_to_local` tools so
+binary assets and standalone local bundles do not require browser fallback.
+
 ## Why the bridge is required
 
 Anthropic's dedicated Claude Design OAuth client uses a manual-code callback.
