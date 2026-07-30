@@ -1,0 +1,35 @@
+{
+  "name": "claude-design",
+  "version": "0.4.0",
+  "description": "Use live Claude Design projects and prototypes from Codex through an authenticated local MCP bridge.",
+  "author": {
+    "name": "Thomas Tiotto"
+  },
+  "homepage": "https://support.claude.com/en/articles/14604416-get-started-with-claude-design",
+  "license": "MIT",
+  "keywords": [
+    "claude-design",
+    "design",
+    "mcp",
+    "prototype"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Claude Design",
+    "shortDescription": "Work with live Claude Design projects from Codex.",
+    "longDescription": "Connects Codex to Anthropic's remote Claude Design MCP through a local bridge and a first-use browser helper for Design's manual-code OAuth flow.",
+    "developerName": "Thomas Tiotto",
+    "category": "Design",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "List my recent Claude Design projects.",
+      "Open this Claude Design project and summarise its structure.",
+      "Create a live prototype from the current implementation."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
