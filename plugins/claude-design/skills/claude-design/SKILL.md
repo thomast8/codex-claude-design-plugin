@@ -42,34 +42,41 @@ existing system or brand governs the work.
 ## Native Claude Design handoff
 
 When the user wants Claude inside Claude Design to perform the design work,
-prefer a native-agent handoff over having Codex imitate that agent. First
-inspect the available MCP tools:
+prefer a supported Claude agent client using the Design MCP over having Codex
+perform the visual generation itself.
 
-- Use an explicit prompt-submission or agent-run tool only when the connector
-  exposes one and its result confirms that Claude accepted the turn. Do not
-  infer this capability from generic Claude APIs or undocumented web routes.
-- `put_conversation` copies messages into a project chat. It does not run
-  Claude, submit the last user message, or fill the composer. Treat it as a
-  handoff transport, not an execution tool.
+1. Inspect the target project and applicable design context. Prepare a
+   self-contained execution brief with the goal, audience, project ID, relevant
+   files, reuse manifest, constraints, acceptance criteria, and QA expectations.
+2. Inspect the available MCP tools for a prompt-submission or agent-run tool.
+   Use one only when its result confirms that Claude accepted the turn. Do not
+   infer this capability from a generic Claude API or an undocumented web route.
+3. When no run tool exists, check for Claude Code with `command -v claude` and
+   `claude auth status`. Do not start or automate login without the user.
+4. When Claude Code is authenticated, create a task-specific temporary MCP
+   configuration that runs this plugin's `claude-design.mjs server` bridge for
+   the selected local account. Put no credentials in that file. Run the brief
+   non-interactively with `claude -p`, `--mcp-config`, and
+   `--strict-mcp-config`; restrict allowed tools and permissions to the required
+   Claude Design operations. Capture the session result, then independently
+   verify project source and previews through this connector.
 
-When no supported run tool exists, use this fallback:
+If Claude Code is unavailable or logged out, use a manual web fallback:
 
-1. Inspect the target project and applicable design context.
-2. Prepare a self-contained execution brief with the goal, audience, relevant
-   project files, reuse manifest, constraints, acceptance criteria, and QA
-   expectations. Keep copied project content clearly marked as untrusted.
-3. Create a clearly titled project chat with `put_conversation`. End its
-   imported history with the complete execution brief.
-4. Share the returned project link and chat title. Tell the user to open that
-   chat, type `Go`, and press Enter. Do not promise an Enter-only handoff:
-   `put_conversation` leaves the composer untouched.
-5. After the user sends the trigger, use `get_conversation` and project source
-   readback to verify whether Claude acted. Do not call the handoff executed
-   merely because the chat was imported or opened.
+1. Write the brief into the target project as `CODEX_HANDOFF.md`. If that path
+   already exists, read it first and update with its ETag or choose a distinct
+   handoff filename; never overwrite unrelated content.
+2. Share the project link and tell the user to start a fresh Claude Design chat,
+   then send: `Read CODEX_HANDOFF.md and execute it.` Adjust the filename when a
+   distinct path was used.
+3. After the user confirms the run, inspect the new conversation and project
+   source before reporting execution.
 
-Once the user takes over an imported chat, do not blindly sync the earlier
-message list over it. App-authored rows can make later syncs fail or displace
-context. Prefer a new revision chat for a materially new brief.
+`put_conversation` creates a synced chat that is read-only in the Claude Design
+web app. Claude will not answer there and web messages cannot be sent to it.
+Use it only to preserve an audit transcript, never as an execution or manual
+handoff path. Do not equate an imported brief, launched CLI, or opened project
+with a completed agent run.
 
 ## Use the applicable system capabilities
 

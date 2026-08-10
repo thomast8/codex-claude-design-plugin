@@ -59,18 +59,19 @@ consistency separately.
 
 ## Hand work to Claude Design
 
-For design-heavy work, Codex can prepare a self-contained brief and copy it
-into the target project's chat with Claude Design's `put_conversation` tool.
-It then returns the project link and imported chat title so the user can open
-the chat, type `Go`, and press Enter. Claude Design keeps the project, design
-system, and visual iteration context while its native Claude agent does the
-generation work; Codex can review the resulting source and preview afterwards.
+For design-heavy work, Codex can prepare a self-contained execution brief and
+hand it to an authenticated Claude Code agent running this plugin's Claude
+Design MCP bridge. Claude performs the generation through the same project and
+design-system tools; Codex then independently reviews the source and preview.
 
-This is currently a human-triggered handoff. The supported MCP surface does not
-publish a tool that submits a prompt to Claude Design's native agent, and
-`put_conversation` leaves the chat composer empty. The plugin therefore never
-equates importing the brief with running it, and does not promise that pressing
-Enter on an empty composer will execute the task.
+When Claude Code is unavailable or logged out, Codex writes the brief to
+`CODEX_HANDOFF.md` in the project and returns the project link. The user starts
+a fresh Claude Design chat and sends `Read CODEX_HANDOFF.md and execute it.`
+
+`put_conversation` is not a prompt-submission fallback. It creates a synced,
+read-only web chat where Claude will not answer and messages cannot be sent.
+The plugin uses it only when an audit transcript is useful and never reports an
+imported conversation as an executed handoff.
 
 ## Multiple Claude accounts
 

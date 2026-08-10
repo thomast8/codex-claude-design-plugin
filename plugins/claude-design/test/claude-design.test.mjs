@@ -140,16 +140,17 @@ test("bridge publishes export and account routing tools", () => {
   );
 });
 
-test("skill keeps native-agent handoff distinct from conversation import", async () => {
+test("skill avoids read-only synced chats for native-agent handoff", async () => {
   const skill = await readFile(
     new URL("../skills/claude-design/SKILL.md", import.meta.url),
     "utf8",
   );
-  assert.match(skill, /`put_conversation` copies messages into a project chat/);
-  assert.match(skill, /It does not run\s+Claude/);
-  assert.match(skill, /type `Go`, and press Enter/);
-  assert.match(skill, /`put_conversation` leaves the composer untouched/);
-  assert.match(skill, /use `get_conversation` and project source\s+readback/);
+  assert.match(skill, /`claude auth status`/);
+  assert.match(skill, /non-interactively with `claude -p`/);
+  assert.match(skill, /Write the brief into the target project as `CODEX_HANDOFF\.md`/);
+  assert.match(skill, /start a fresh Claude Design chat/);
+  assert.match(skill, /`put_conversation` creates a synced chat that is read-only/);
+  assert.doesNotMatch(skill, /type `Go`, and press Enter/);
 });
 
 test("named accounts use isolated credential files", async () => {
