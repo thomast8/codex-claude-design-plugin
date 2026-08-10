@@ -8,6 +8,7 @@ import {
   lstat,
   mkdir,
   readFile,
+  readdir,
   realpath,
   rm,
   writeFile,
@@ -33,9 +34,15 @@ export const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 export const MANUAL_REDIRECT_URL =
   "https://platform.claude.com/oauth/code/callback";
 export const MCP_URL = "https://api.anthropic.com/v1/design/mcp";
+export const CONFIG_DIR =
+  process.env.CODEX_CLAUDE_DESIGN_CONFIG_DIR ||
+  join(homedir(), ".config", "codex-claude-design");
 export const STORE_PATH =
   process.env.CODEX_CLAUDE_DESIGN_CREDENTIALS ||
-  join(homedir(), ".config", "codex-claude-design", "credentials.json");
+  join(CONFIG_DIR, "credentials.json");
+export const ACCOUNTS_DIR = join(CONFIG_DIR, "accounts");
+export const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+export const DEFAULT_ACCOUNT = "default";
 
 const REFRESH_SKEW_MS = 60_000;
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
@@ -45,6 +52,13 @@ const MAX_EXPORT_BYTES = 512 * 1024 * 1024;
 const MAX_EXPORT_FILES = 20_000;
 const EXPORT_MANIFEST = ".claude-design-export.json";
 const require = createRequire(import.meta.url);
+
+const ACCOUNT_PROPERTY = {
+  type: "string",
+  pattern: "^[a-z0-9][a-z0-9_-]{0,31}$",
+  description:
+    "Optional named Claude account for this call. Omit it to use the session route.",
+};
 
 export const LOCAL_TOOLS = [
   {
@@ -69,6 +83,7 @@ export const LOCAL_TOOLS = [
           description:
             "Absolute destination file path. Existing files are never overwritten.",
         },
+        account: ACCOUNT_PROPERTY,
       },
     },
   },
@@ -90,10 +105,157 @@ export const LOCAL_TOOLS = [
           description:
             "Absolute destination directory under the user's home or temporary directory. It must not already exist.",
         },
+        account: ACCOUNT_PROPERTY,
+      },
+    },
+  },
+  {
+    name: "list_accounts",
+    description:
+      "List configured Claude Design account profiles and show the current session route. Never returns credentials or tokens.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  {
+    name: "set_session_account",
+    description:
+      "Route subsequent Claude Design calls in this Codex instance to a named account. This changes only the running session and does not change the persistent default.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["account"],
+      properties: {
+        account: {
+          ...ACCOUNT_PROPERTY,
+          description: "Named Claude account to use for subsequent calls.",
+        },
       },
     },
   },
 ];
+
+export function validateAccountName(account) {
+  if (
+    typeof account !== "string" ||
+    !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(account)
+  ) {
+    throw new Error(
+      "Account names must be 1-32 lowercase letters, numbers, underscores, or hyphens, and must start with a letter or number.",
+    );
+  }
+  return account;
+}
+
+async function pathExists(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+export async function credentialPathForAccount(account = DEFAULT_ACCOUNT) {
+  const safeAccount = validateAccountName(account);
+  if (process.env.CODEX_CLAUDE_DESIGN_CREDENTIALS) {
+    if (safeAccount !== DEFAULT_ACCOUNT) {
+      throw new Error(
+        "CODEX_CLAUDE_DESIGN_CREDENTIALS fixes this process to the default account. Use CODEX_CLAUDE_DESIGN_CONFIG_DIR for named accounts.",
+      );
+    }
+    return STORE_PATH;
+  }
+  const accountPath = join(ACCOUNTS_DIR, `${safeAccount}.json`);
+  if (
+    safeAccount === DEFAULT_ACCOUNT &&
+    !(await pathExists(accountPath)) &&
+    (await pathExists(STORE_PATH))
+  ) {
+    return STORE_PATH;
+  }
+  return accountPath;
+}
+
+async function readJson(path) {
+  try {
+    return JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function readConfig() {
+  return (await readJson(CONFIG_PATH)) || {};
+}
+
+async function saveConfig(config) {
+  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  await chmod(CONFIG_DIR, 0o700);
+  await writeFile(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  await chmod(CONFIG_PATH, 0o600);
+}
+
+export async function configuredDefaultAccount() {
+  const config = await readConfig();
+  return config.defaultAccount
+    ? validateAccountName(config.defaultAccount)
+    : DEFAULT_ACCOUNT;
+}
+
+export async function setConfiguredDefaultAccount(account) {
+  const safeAccount = validateAccountName(account);
+  const store = await readAccountStore(safeAccount);
+  if (!store?.accessToken || !store?.refreshToken) {
+    throw new Error(
+      `Claude Design account '${safeAccount}' is not logged in. Run login --account ${safeAccount} first.`,
+    );
+  }
+  const config = await readConfig();
+  await saveConfig({ ...config, defaultAccount: safeAccount });
+  return safeAccount;
+}
+
+export async function listAccountProfiles() {
+  const names = new Set();
+  if (await pathExists(STORE_PATH)) names.add(DEFAULT_ACCOUNT);
+  try {
+    for (const entry of await readdir(ACCOUNTS_DIR, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const name = entry.name.slice(0, -5);
+      try {
+        names.add(validateAccountName(name));
+      } catch {
+        // Ignore unrelated files in the credentials directory.
+      }
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const configuredDefault = await configuredDefaultAccount();
+  const profiles = [];
+  for (const name of [...names].sort()) {
+    const store = await readAccountStore(name);
+    profiles.push({
+      name,
+      default: name === configuredDefault,
+      status:
+        store?.accessToken && store?.refreshToken
+          ? !store.expiresAt || Date.now() >= store.expiresAt
+            ? "expired"
+            : "logged_in"
+          : "logged_out",
+      expiresAt: store?.expiresAt || null,
+    });
+  }
+  return profiles;
+}
 
 function base64Url(value) {
   return Buffer.from(value)
@@ -135,23 +297,22 @@ export function parsePastedCode(raw) {
   return { code, state };
 }
 
-async function readStore() {
-  try {
-    return JSON.parse(await readFile(STORE_PATH, "utf8"));
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
-  }
+async function readAccountStore(account = DEFAULT_ACCOUNT) {
+  return readJson(await credentialPathForAccount(account));
 }
 
-export async function saveStore(data) {
-  const storeDirectory = dirname(STORE_PATH);
+export async function saveStore(
+  data,
+  { account = DEFAULT_ACCOUNT, storePath } = {},
+) {
+  const targetPath = storePath || (await credentialPathForAccount(account));
+  const storeDirectory = dirname(targetPath);
   await mkdir(storeDirectory, { recursive: true, mode: 0o700 });
   await chmod(storeDirectory, 0o700);
-  await writeFile(STORE_PATH, `${JSON.stringify(data, null, 2)}\n`, {
+  await writeFile(targetPath, `${JSON.stringify(data, null, 2)}\n`, {
     mode: 0o600,
   });
-  await chmod(STORE_PATH, 0o600);
+  await chmod(targetPath, 0o600);
 }
 
 async function requestTokens(body, label) {
@@ -159,7 +320,7 @@ async function requestTokens(body, label) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "User-Agent": "codex-claude-design/0.5.0",
+      "User-Agent": "codex-claude-design/0.6.0",
     },
     body: JSON.stringify(body),
   });
@@ -184,7 +345,7 @@ async function exchangeCode({ code, state, verifier }) {
   );
 }
 
-async function refreshStore(store) {
+async function refreshStore(store, { account, storePath }) {
   const tokenResponse = await requestTokens(
     {
       grant_type: "refresh_token",
@@ -196,7 +357,7 @@ async function refreshStore(store) {
   );
   const next = toStore(tokenResponse, store);
   verifyScopes(next.scopes);
-  await saveStore(next);
+  await saveStore(next, { account, storePath });
   return next;
 }
 
@@ -223,16 +384,25 @@ function verifyScopes(scopes) {
   }
 }
 
-export async function ensureAccessToken({ forceRefresh = false } = {}) {
-  let store = await readStore();
+export async function ensureAccessToken({
+  forceRefresh = false,
+  account = DEFAULT_ACCOUNT,
+} = {}) {
+  const safeAccount = validateAccountName(account);
+  const storePath = await credentialPathForAccount(safeAccount);
+  let store = await readJson(storePath);
   if (!store?.accessToken || !store?.refreshToken) {
-    throw new Error("Claude Design is not logged in. Run the plugin login command.");
+    throw new Error(
+      `Claude Design account '${safeAccount}' is not logged in. Run the plugin login command with --account ${safeAccount}.`,
+    );
   }
   const shouldRefresh =
     forceRefresh ||
     !store.expiresAt ||
     Date.now() >= store.expiresAt - REFRESH_SKEW_MS;
-  if (shouldRefresh) store = await refreshStore(store);
+  if (shouldRefresh) {
+    store = await refreshStore(store, { account: safeAccount, storePath });
+  }
   verifyScopes(store.scopes || []);
   return store.accessToken;
 }
@@ -259,7 +429,33 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function renderLoginPage({ authoriseUrl, formToken, error = "" }) {
+export function renderLoginPage({
+  authoriseUrl,
+  formToken,
+  account = DEFAULT_ACCOUNT,
+  accountEditable = false,
+  accounts = [],
+  error = "",
+  notice = "",
+}) {
+  const accountRows = accounts
+    .map((profile) => {
+      const status =
+        profile.status === "logged_in"
+          ? "Logged in"
+          : profile.status === "expired"
+            ? "Expired"
+            : "Logged out";
+      return `<li>
+        <span><strong>${escapeHtml(profile.name)}</strong>${profile.default ? " <span class=\"badge\">default</span>" : ""}<br><span class="fine">${status}</span></span>
+        <form method="post" action="/remove-account">
+          <input type="hidden" name="form_token" value="${escapeHtml(formToken)}">
+          <input type="hidden" name="account" value="${escapeHtml(profile.name)}">
+          <button class="danger" type="submit">Remove</button>
+        </form>
+      </li>`;
+    })
+    .join("\n");
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -273,34 +469,68 @@ function renderLoginPage({ authoriseUrl, formToken, error = "" }) {
     h1 { margin-top: 0; }
     p { line-height: 1.5; }
     a, button { display: inline-block; border: 0; border-radius: .6rem; padding: .75rem 1rem; background: #d97757; color: white; font: inherit; font-weight: 650; text-decoration: none; cursor: pointer; }
+    button.danger { background: transparent; color: #c33; border: 1px solid currentColor; padding: .45rem .7rem; }
     label { display: block; margin: 1.5rem 0 .5rem; font-weight: 650; }
     input { box-sizing: border-box; width: 100%; padding: .75rem; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); border-radius: .5rem; font: inherit; }
     .error { color: #c33; }
+    .notice { color: #287a3e; }
     .fine { font-size: .875rem; opacity: .75; }
+    .accounts { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid color-mix(in srgb, CanvasText 20%, transparent); }
+    .accounts ul { list-style: none; padding: 0; }
+    .accounts li { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .75rem 0; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent); }
+    .accounts form { margin: 0; }
+    .badge { display: inline-block; padding: .1rem .4rem; border-radius: 999px; background: color-mix(in srgb, CanvasText 12%, transparent); font-size: .75rem; font-weight: 650; }
   </style>
 </head>
 <body>
   <main>
     <h1>Connect Claude Design</h1>
-    <p>Open Claude in a new tab and approve Design access. Claude will display a short-lived <code>CODE#STATE</code> value.</p>
+    <p>Make sure Claude is signed in to the account you want to connect, then approve Design access. Claude will display a short-lived <code>CODE#STATE</code> value.</p>
     <p><a href="${escapeHtml(authoriseUrl)}" target="_blank" rel="noreferrer">Authorise with Claude</a></p>
+    ${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ""}
     ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
     <form method="post" action="/complete">
       <input type="hidden" name="form_token" value="${escapeHtml(formToken)}">
+      ${
+        accountEditable
+          ? `<label for="account">Local profile name</label>
+      <input id="account" name="account" value="${escapeHtml(account)}" pattern="[a-z0-9][a-z0-9_-]{0,31}" maxlength="32" autocomplete="off" spellcheck="false" required>
+      <p class="fine">Use 1–32 lowercase letters, numbers, underscores, or hyphens. This name stays on your machine.</p>`
+          : `<p>Saving this connection as local profile <strong>${escapeHtml(account)}</strong>.</p>`
+      }
       <label for="code">Paste the full CODE#STATE value</label>
       <input id="code" name="code" autocomplete="off" spellcheck="false" required>
       <p><button type="submit">Finish connection</button></p>
     </form>
     <p class="fine">This helper is running only on 127.0.0.1. The code is sent directly to Anthropic and is not added to Codex chat.</p>
+    <section class="accounts">
+      <h2>Existing profiles</h2>
+      ${accountRows ? `<ul>${accountRows}</ul>` : '<p class="fine">No saved Claude Design profiles.</p>'}
+    </section>
   </main>
 </body>
 </html>`;
 }
 
-function renderSuccessPage() {
+export function renderRemoveAccountConfirmation({ account, formToken }) {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Remove Claude Design profile</title></head>
+<body style="font-family:system-ui,sans-serif;margin:3rem;max-width:38rem">
+  <h1>Remove local profile?</h1>
+  <p>This will delete the stored Claude Design credentials for <strong>${escapeHtml(account)}</strong> from this machine. Other profiles are not affected, and you can reconnect this account later.</p>
+  <form method="post" action="/remove-account/confirm">
+    <input type="hidden" name="form_token" value="${escapeHtml(formToken)}">
+    <input type="hidden" name="account" value="${escapeHtml(account)}">
+    <button type="submit" style="border:0;border-radius:.6rem;padding:.75rem 1rem;background:#c33;color:white;font:inherit;font-weight:650;cursor:pointer">Remove ${escapeHtml(account)}</button>
+    <a href="/" style="margin-left:1rem">Cancel</a>
+  </form>
+</body></html>`;
+}
+
+function renderSuccessPage(account = DEFAULT_ACCOUNT) {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Claude Design connected</title></head>
-<body style="font-family:system-ui,sans-serif;margin:3rem"><h1>Claude Design connected</h1><p>You can close this tab and return to Codex.</p></body></html>`;
+<body style="font-family:system-ui,sans-serif;margin:3rem"><h1>Claude Design connected</h1><p>Profile <strong>${escapeHtml(account)}</strong> is ready. You can close this tab and return to Codex.</p></body></html>`;
 }
 
 async function readForm(request) {
@@ -312,7 +542,12 @@ async function readForm(request) {
   return new URLSearchParams(body);
 }
 
-export async function login({ launchBrowser = true } = {}) {
+export async function login({
+  launchBrowser = true,
+  account = DEFAULT_ACCOUNT,
+  allowAccountRename = true,
+} = {}) {
+  const safeAccount = validateAccountName(account);
   const { verifier, challenge } = createPkce();
   const state = createState();
   const authoriseUrl = buildAuthoriseUrl({ challenge, state });
@@ -336,13 +571,44 @@ export async function login({ launchBrowser = true } = {}) {
       });
       response.end(html);
     };
+    const profilesForPage = async () => {
+      try {
+        return await listAccountProfiles();
+      } catch {
+        return [];
+      }
+    };
+    const sendLoginPage = async (
+      status,
+      { error = "", notice = "" } = {},
+    ) => {
+      send(
+        status,
+        renderLoginPage({
+          authoriseUrl,
+          formToken,
+          account: safeAccount,
+          accountEditable: allowAccountRename,
+          accounts: await profilesForPage(),
+          error,
+          notice,
+        }),
+      );
+    };
 
     try {
       if (request.method === "GET" && request.url === "/") {
-        send(200, renderLoginPage({ authoriseUrl, formToken }));
+        await sendLoginPage(200);
         return;
       }
-      if (request.method !== "POST" || request.url !== "/complete") {
+      if (
+        request.method !== "POST" ||
+        ![
+          "/complete",
+          "/remove-account",
+          "/remove-account/confirm",
+        ].includes(request.url)
+      ) {
         send(404, "<h1>Not found</h1>");
         return;
       }
@@ -351,6 +617,36 @@ export async function login({ launchBrowser = true } = {}) {
       if (form.get("form_token") !== formToken) {
         throw new Error("The local login form has expired. Start the flow again.");
       }
+      if (request.url === "/remove-account") {
+        const accountToRemove = validateAccountName(form.get("account") || "");
+        const profiles = await listAccountProfiles();
+        if (!profiles.some((profile) => profile.name === accountToRemove)) {
+          throw new Error(`Local profile '${accountToRemove}' was not found.`);
+        }
+        send(
+          200,
+          renderRemoveAccountConfirmation({
+            account: accountToRemove,
+            formToken,
+          }),
+        );
+        return;
+      }
+      if (request.url === "/remove-account/confirm") {
+        const accountToRemove = validateAccountName(form.get("account") || "");
+        const profiles = await listAccountProfiles();
+        if (!profiles.some((profile) => profile.name === accountToRemove)) {
+          throw new Error(`Local profile '${accountToRemove}' was not found.`);
+        }
+        await removeAccountCredentials(accountToRemove);
+        await sendLoginPage(200, {
+          notice: `Removed local profile '${accountToRemove}'.`,
+        });
+        return;
+      }
+      const submittedAccount = allowAccountRename
+        ? validateAccountName(form.get("account") || "")
+        : safeAccount;
       const parsed = parsePastedCode(form.get("code") || "");
       if (!parsed) {
         throw new Error("Paste the full value, including the # separator.");
@@ -366,13 +662,13 @@ export async function login({ launchBrowser = true } = {}) {
       });
       const store = toStore(tokenResponse);
       verifyScopes(store.scopes);
-      await saveStore(store);
-      send(200, renderSuccessPage());
+      await saveStore(store, { account: submittedAccount });
+      send(200, renderSuccessPage(submittedAccount));
       settled = true;
-      resolveLogin(store);
+      resolveLogin({ ...store, account: submittedAccount });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      send(400, renderLoginPage({ authoriseUrl, formToken, error: message }));
+      await sendLoginPage(400, { error: message });
     }
   });
 
@@ -389,7 +685,7 @@ export async function login({ launchBrowser = true } = {}) {
     throw new Error("Could not start the local Claude Design login helper.");
   }
   const localUrl = `http://127.0.0.1:${address.port}/`;
-  process.stderr.write(`Claude Design login: ${localUrl}\n`);
+  process.stderr.write(`Claude Design login (${safeAccount}): ${localUrl}\n`);
   if (launchBrowser) openBrowser(localUrl);
 
   const timeout = setTimeout(() => {
@@ -397,7 +693,7 @@ export async function login({ launchBrowser = true } = {}) {
   }, LOGIN_TIMEOUT_MS);
   try {
     const store = await completion;
-    process.stderr.write("Claude Design authorised.\n");
+    process.stderr.write(`Claude Design account '${store.account}' authorised.\n`);
     return store;
   } finally {
     clearTimeout(timeout);
@@ -405,25 +701,36 @@ export async function login({ launchBrowser = true } = {}) {
   }
 }
 
-export async function status() {
-  const store = await readStore();
+export async function status(account = DEFAULT_ACCOUNT) {
+  const safeAccount = validateAccountName(account);
+  const storePath = await credentialPathForAccount(safeAccount);
+  const store = await readJson(storePath);
+  console.log(`account: ${safeAccount}`);
   if (!store) {
     console.log("status: logged_out");
-    console.log(`credentials: ${STORE_PATH}`);
+    console.log(`credentials: ${storePath}`);
     return;
   }
   const expired = !store.expiresAt || Date.now() >= store.expiresAt;
   console.log(`status: ${expired ? "expired" : "logged_in"}`);
-  console.log(`credentials: ${STORE_PATH}`);
+  console.log(`credentials: ${storePath}`);
   console.log(`scopes: ${(store.scopes || []).join(" ")}`);
   console.log(
     `expires: ${store.expiresAt ? new Date(store.expiresAt).toISOString() : "unknown"}`,
   );
 }
 
-export async function logout() {
-  await rm(STORE_PATH, { force: true });
-  console.log(`Removed ${STORE_PATH}`);
+export async function logout(account = DEFAULT_ACCOUNT) {
+  const safeAccount = validateAccountName(account);
+  const storePath = await removeAccountCredentials(safeAccount);
+  console.log(`Removed Claude Design account '${safeAccount}' at ${storePath}`);
+}
+
+export async function removeAccountCredentials(account) {
+  const safeAccount = validateAccountName(account);
+  const storePath = await credentialPathForAccount(safeAccount);
+  await rm(storePath, { force: true });
+  return storePath;
 }
 
 function isPathInside(root, target) {
@@ -615,7 +922,7 @@ async function readProjectTextFile(callRemoteTool, projectId, file) {
 async function fetchProjectAsset(url, expectedSize) {
   const response = await fetch(url, {
     redirect: "error",
-    headers: { "User-Agent": "codex-claude-design/0.5.0" },
+    headers: { "User-Agent": "codex-claude-design/0.6.0" },
   });
   if (!response.ok) {
     throw new Error(`Project file download failed (${response.status}).`);
@@ -834,50 +1141,250 @@ function resolveMcpRemote() {
   }
 }
 
-function startProtocolProxy(child) {
-  const pending = new Map();
-  let nextInternalId = 1;
-  const childLines = createInterface({ input: child.stdout });
+export function withoutAccountArgument(arguments_ = {}) {
+  const { account: _account, ...remoteArguments } = arguments_;
+  return remoteArguments;
+}
+
+function toolWithAccountRoute(tool) {
+  const inputSchema = tool.inputSchema || { type: "object", properties: {} };
+  if (inputSchema.type !== "object") return tool;
+  if (inputSchema.properties?.account) {
+    throw new Error(`Remote tool '${tool.name}' already defines account.`);
+  }
+  return {
+    ...tool,
+    inputSchema: {
+      ...inputSchema,
+      properties: {
+        ...(inputSchema.properties || {}),
+        account: ACCOUNT_PROPERTY,
+      },
+    },
+  };
+}
+
+function toolWithoutAccountRoute(tool) {
+  if (tool.name === "set_session_account") return null;
+  const inputSchema = tool.inputSchema;
+  if (inputSchema?.type !== "object" || !inputSchema.properties?.account) {
+    return tool;
+  }
+  const { account: _account, ...properties } = inputSchema.properties;
+  return { ...tool, inputSchema: { ...inputSchema, properties } };
+}
+
+export function toolsForAccountRouting(remoteTools, { pinned = false } = {}) {
+  const collision = remoteTools.find((remoteTool) =>
+    LOCAL_TOOLS.some((localTool) => localTool.name === remoteTool.name),
+  );
+  if (collision) throw new Error(`Remote tool collision: ${collision.name}`);
+  if (pinned) {
+    return [...remoteTools, ...LOCAL_TOOLS]
+      .map(toolWithoutAccountRoute)
+      .filter(Boolean);
+  }
+  return [
+    ...remoteTools.map(toolWithAccountRoute),
+    ...LOCAL_TOOLS,
+  ];
+}
+
+function spawnRemote(accessToken) {
+  const localBinary = resolveMcpRemote();
+  const command = localBinary ? process.execPath : "npx";
+  const commonArgs = [
+    MCP_URL,
+    "--silent",
+    "--transport",
+    "http-only",
+    "--header",
+    "Authorization:Bearer ${CODEX_CLAUDE_DESIGN_ACCESS_TOKEN}",
+  ];
+  const args = localBinary
+    ? [localBinary, ...commonArgs]
+    : ["-y", `mcp-remote@${MCP_REMOTE_VERSION}`, ...commonArgs];
+  const child = spawn(command, args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      CODEX_CLAUDE_DESIGN_ACCESS_TOKEN: accessToken,
+    },
+  });
+  child.stderr.on("data", (buffer) => {
+    const text = String(buffer).replace(
+      /Bearer\s+[A-Za-z0-9._~-]+/g,
+      "Bearer [REDACTED]",
+    );
+    process.stderr.write(text);
+  });
+  return child;
+}
+
+class RemoteConnection {
+  constructor(account, accessToken, onUnhandledMessage, onClose) {
+    this.account = account;
+    this.closed = false;
+    this.child = spawnRemote(accessToken);
+    this.pending = new Map();
+    this.nextInternalId = 1;
+    this.lines = createInterface({ input: this.child.stdout });
+    this.lines.on("line", (line) => {
+      if (!line.trim()) return;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        process.stderr.write(
+          `Claude Design bridge ignored non-JSON output from '${account}'.\n`,
+        );
+        return;
+      }
+      const waiter = this.pending.get(message.id);
+      if (waiter) {
+        this.pending.delete(message.id);
+        if (message.error) {
+          waiter.reject(
+            new Error(message.error.message || "Remote MCP request failed."),
+          );
+        } else {
+          waiter.resolve(message.result);
+        }
+        return;
+      }
+      onUnhandledMessage(this, message);
+    });
+    const rejectPending = (error) => {
+      for (const waiter of this.pending.values()) waiter.reject(error);
+      this.pending.clear();
+    };
+    const close = (error) => {
+      if (this.closed) return;
+      this.closed = true;
+      rejectPending(error);
+      onClose(this);
+    };
+    this.child.once("error", (error) => close(error));
+    this.child.once("exit", () => {
+      close(new Error(`Claude Design account '${account}' stopped.`));
+      this.lines.close();
+    });
+  }
+
+  send(message) {
+    if (this.closed || this.child.stdin.destroyed) {
+      throw new Error(`Claude Design account '${this.account}' is not running.`);
+    }
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  request(method, params) {
+    return new Promise((resolveRequest, rejectRequest) => {
+      const id = `claude-design-bridge-${this.nextInternalId++}`;
+      this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
+      try {
+        this.send({ jsonrpc: "2.0", id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        rejectRequest(error);
+      }
+    });
+  }
+
+  stop(signal = "SIGTERM") {
+    if (!this.child.killed) this.child.kill(signal);
+  }
+}
+
+function startProtocolProxy({ initialAccount, pinned }) {
+  const connections = new Map();
+  const startingConnections = new Map();
+  const serverRequests = new Map();
+  let currentAccount = initialAccount;
+  let initialiseParams;
+  let initialised = false;
+  let nextServerRequestId = 1;
   const parentLines = createInterface({ input: process.stdin });
 
-  const writeToChild = (message) => {
-    child.stdin.write(`${JSON.stringify(message)}\n`);
-  };
   const writeToParent = (message) => {
     process.stdout.write(`${JSON.stringify(message)}\n`);
   };
-  const requestRemote = (method, params) =>
-    new Promise((resolveRequest, rejectRequest) => {
-      const id = `claude-design-bridge-${nextInternalId++}`;
-      pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
-      writeToChild({ jsonrpc: "2.0", id, method, params });
-    });
-  const callRemoteTool = (name, arguments_) =>
-    requestRemote("tools/call", { name, arguments: arguments_ });
 
-  childLines.on("line", (line) => {
-    if (!line.trim()) return;
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch {
-      process.stderr.write("Claude Design bridge ignored non-JSON output.\n");
-      return;
-    }
-    const waiter = pending.get(message.id);
-    if (waiter) {
-      pending.delete(message.id);
-      if (message.error) {
-        waiter.reject(
-          new Error(message.error.message || "Remote MCP request failed."),
-        );
-      } else {
-        waiter.resolve(message.result);
-      }
+  const handleUnhandledMessage = (connection, message) => {
+    if (message.method && message.id !== undefined) {
+      const parentId = `claude-design-server-${nextServerRequestId++}`;
+      serverRequests.set(parentId, { connection, childId: message.id });
+      writeToParent({ ...message, id: parentId });
       return;
     }
     writeToParent(message);
-  });
+  };
+
+  const ensureConnection = async (account) => {
+    const safeAccount = validateAccountName(account);
+    if (connections.has(safeAccount)) return connections.get(safeAccount);
+    if (startingConnections.has(safeAccount)) {
+      return startingConnections.get(safeAccount);
+    }
+    const starting = (async () => {
+      try {
+        await ensureAccessToken({ account: safeAccount });
+      } catch (error) {
+        if (!String(error?.message || error).includes("is not logged in")) {
+          throw error;
+        }
+        process.stderr.write(
+          `Claude Design account '${safeAccount}' is not connected. Opening the local login helper.\n`,
+        );
+        await login({ account: safeAccount, allowAccountRename: false });
+      }
+      const accessToken = await ensureAccessToken({ account: safeAccount });
+      const connection = new RemoteConnection(
+        safeAccount,
+        accessToken,
+        handleUnhandledMessage,
+        (closedConnection) => {
+          if (connections.get(safeAccount) === closedConnection) {
+            connections.delete(safeAccount);
+          }
+        },
+      );
+      try {
+        if (initialiseParams) {
+          await connection.request("initialize", initialiseParams);
+          if (initialised) {
+            connection.send({
+              jsonrpc: "2.0",
+              method: "notifications/initialized",
+            });
+          }
+        }
+      } catch (error) {
+        connection.stop();
+        throw error;
+      }
+      connections.set(safeAccount, connection);
+      return connection;
+    })();
+    startingConnections.set(safeAccount, starting);
+    try {
+      return await starting;
+    } finally {
+      startingConnections.delete(safeAccount);
+    }
+  };
+
+  const accountForArguments = (arguments_ = {}) => {
+    const requested = arguments_.account;
+    if (!requested) return currentAccount;
+    const safeRequested = validateAccountName(requested);
+    if (pinned && safeRequested !== currentAccount) {
+      throw new Error(
+        `This Codex instance is pinned to Claude Design account '${currentAccount}'.`,
+      );
+    }
+    return safeRequested;
+  };
 
   parentLines.on("line", async (line) => {
     if (!line.trim()) return;
@@ -885,47 +1392,107 @@ function startProtocolProxy(child) {
     try {
       message = JSON.parse(line);
     } catch {
-      child.stdin.write(`${line}\n`);
+      process.stderr.write("Claude Design bridge ignored non-JSON input.\n");
       return;
     }
 
     try {
-      if (message.method === "tools/list" && message.id !== undefined) {
-        const result = await requestRemote("tools/list", message.params || {});
-        const remoteTools = Array.isArray(result?.tools) ? result.tools : [];
-        const remoteNames = new Set(remoteTools.map((tool) => tool.name));
-        const collisions = LOCAL_TOOLS.filter((tool) =>
-          remoteNames.has(tool.name),
-        );
-        if (collisions.length > 0) {
-          throw new Error(
-            `Remote tool collision: ${collisions.map((tool) => tool.name).join(", ")}`,
-          );
+      if (!message.method && message.id !== undefined) {
+        const serverRequest = serverRequests.get(message.id);
+        if (serverRequest) {
+          serverRequests.delete(message.id);
+          serverRequest.connection.send({
+            ...message,
+            id: serverRequest.childId,
+          });
         }
+        return;
+      }
+
+      if (message.method === "initialize" && message.id !== undefined) {
+        const params = message.params || {};
+        const connection = await ensureConnection(currentAccount);
+        const result = await connection.request("initialize", params);
+        initialiseParams = params;
+        writeToParent({ jsonrpc: "2.0", id: message.id, result });
+        return;
+      }
+
+      if (message.method === "notifications/initialized") {
+        initialised = true;
+        for (const connection of connections.values()) connection.send(message);
+        return;
+      }
+
+      if (message.method === "tools/list" && message.id !== undefined) {
+        const connection = await ensureConnection(currentAccount);
+        const result = await connection.request(
+          "tools/list",
+          message.params || {},
+        );
+        const remoteTools = Array.isArray(result?.tools) ? result.tools : [];
         writeToParent({
           jsonrpc: "2.0",
           id: message.id,
-          result: { ...result, tools: [...remoteTools, ...LOCAL_TOOLS] },
+          result: {
+            ...result,
+            tools: toolsForAccountRouting(remoteTools, { pinned }),
+          },
         });
         return;
       }
 
-      if (
-        message.method === "tools/call" &&
-        message.id !== undefined &&
-        LOCAL_TOOLS.some((tool) => tool.name === message.params?.name)
-      ) {
+      if (message.method === "tools/call" && message.id !== undefined) {
+        const toolName = message.params?.name;
+        const arguments_ = message.params?.arguments || {};
         let payload;
-        if (message.params.name === "download_file_to_local") {
+        if (toolName === "list_accounts") {
+          payload = {
+            current_account: currentAccount,
+            pinned,
+            accounts: await listAccountProfiles(),
+          };
+        } else if (toolName === "set_session_account") {
+          if (pinned) {
+            throw new Error(
+              `This Codex instance is pinned to Claude Design account '${currentAccount}'.`,
+            );
+          }
+          const nextAccount = validateAccountName(arguments_.account);
+          await ensureConnection(nextAccount);
+          currentAccount = nextAccount;
+          payload = { current_account: currentAccount, pinned: false };
+        } else if (toolName === "download_file_to_local") {
+          const account = accountForArguments(arguments_);
+          const connection = await ensureConnection(account);
           payload = await downloadFileToLocal(
-            message.params.arguments || {},
-            callRemoteTool,
+            withoutAccountArgument(arguments_),
+            (name, remoteArguments) =>
+              connection.request("tools/call", {
+                name,
+                arguments: remoteArguments,
+              }),
+          );
+        } else if (toolName === "export_project_to_local") {
+          const account = accountForArguments(arguments_);
+          const connection = await ensureConnection(account);
+          payload = await exportProjectToLocal(
+            withoutAccountArgument(arguments_),
+            (name, remoteArguments) =>
+              connection.request("tools/call", {
+                name,
+                arguments: remoteArguments,
+              }),
           );
         } else {
-          payload = await exportProjectToLocal(
-            message.params.arguments || {},
-            callRemoteTool,
-          );
+          const account = accountForArguments(arguments_);
+          const connection = await ensureConnection(account);
+          const result = await connection.request("tools/call", {
+            ...message.params,
+            arguments: withoutAccountArgument(arguments_),
+          });
+          writeToParent({ jsonrpc: "2.0", id: message.id, result });
+          return;
         }
         writeToParent({
           jsonrpc: "2.0",
@@ -934,7 +1501,17 @@ function startProtocolProxy(child) {
         });
         return;
       }
-      writeToChild(message);
+
+      const connection = await ensureConnection(currentAccount);
+      if (message.id !== undefined) {
+        const result = await connection.request(
+          message.method,
+          message.params || {},
+        );
+        writeToParent({ jsonrpc: "2.0", id: message.id, result });
+      } else {
+        connection.send(message);
+      }
     } catch (error) {
       if (
         message.method === "tools/call" &&
@@ -958,91 +1535,137 @@ function startProtocolProxy(child) {
     }
   });
 
-  const rejectPending = (error) => {
-    for (const waiter of pending.values()) waiter.reject(error);
-    pending.clear();
-  };
-  child.once("error", rejectPending);
-  child.once("exit", () => {
-    rejectPending(new Error("Remote Claude Design MCP stopped."));
-    childLines.close();
-    parentLines.close();
-  });
   parentLines.once("close", () => {
-    if (!child.stdin.destroyed) child.stdin.end();
+    for (const connection of connections.values()) connection.stop();
+  });
+  return {
+    stop(signal = "SIGTERM") {
+      parentLines.close();
+      for (const connection of connections.values()) connection.stop(signal);
+    },
+  };
+}
+
+export async function startServer({ account, pinned = false } = {}) {
+  const initialAccount = account || (await configuredDefaultAccount());
+  validateAccountName(initialAccount);
+  const proxy = startProtocolProxy({ initialAccount, pinned });
+  await new Promise((resolve) => {
+    let finished = false;
+    const finish = (signal = "SIGTERM") => {
+      if (finished) return;
+      finished = true;
+      proxy.stop(signal);
+      resolve();
+    };
+    process.once("SIGINT", () => finish("SIGINT"));
+    process.once("SIGTERM", () => finish("SIGTERM"));
+    process.stdin.once("end", () => finish());
   });
 }
 
-export async function startServer() {
-  const existingStore = await readStore();
-  if (!existingStore?.accessToken || !existingStore?.refreshToken) {
-    process.stderr.write(
-      "Claude Design is not yet connected. Opening the local login helper.\n",
-    );
-    await login();
-  }
-  const accessToken = await ensureAccessToken();
-  const localBinary = resolveMcpRemote();
-  const command = localBinary ? process.execPath : "npx";
-  const commonArgs = [
-    MCP_URL,
-    "--silent",
-    "--transport",
-    "http-only",
-    "--header",
-    "Authorization:Bearer ${CODEX_CLAUDE_DESIGN_ACCESS_TOKEN}",
-  ];
-  const args = localBinary
-    ? [localBinary, ...commonArgs]
-    : ["-y", `mcp-remote@${MCP_REMOTE_VERSION}`, ...commonArgs];
-  const child = spawn(command, args, {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: {
-      ...process.env,
-      CODEX_CLAUDE_DESIGN_ACCESS_TOKEN: accessToken,
-    },
-  });
-
-  child.stderr.on("data", (buffer) => {
-    const text = String(buffer).replace(
-      /Bearer\s+[A-Za-z0-9._~-]+/g,
-      "Bearer [REDACTED]",
-    );
-    process.stderr.write(text);
-  });
-  startProtocolProxy(child);
-  const stopChild = (signal) => {
-    if (!child.killed) child.kill(signal);
-  };
-  process.once("SIGINT", () => stopChild("SIGINT"));
-  process.once("SIGTERM", () => stopChild("SIGTERM"));
-
-  await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
-      if (signal) {
-        resolve();
-      } else if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`MCP proxy exited with code ${code ?? 1}`));
+export function parseCliArguments(argv) {
+  const positional = [];
+  let account;
+  let noOpen = false;
+  let all = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--account") {
+      if (account !== undefined || index + 1 >= argv.length) {
+        throw new Error("--account requires one account name.");
       }
-    });
-  });
+      account = validateAccountName(argv[++index]);
+    } else if (argument.startsWith("--account=")) {
+      if (account !== undefined) throw new Error("--account was provided twice.");
+      account = validateAccountName(argument.slice("--account=".length));
+    } else if (argument === "--no-open") {
+      noOpen = true;
+    } else if (argument === "--all") {
+      all = true;
+    } else if (argument.startsWith("-")) {
+      throw new Error(`Unknown option: ${argument}`);
+    } else {
+      positional.push(argument);
+    }
+  }
+  return { account, all, noOpen, positional };
 }
 
 async function main() {
   const command = process.argv[2] || "server";
+  const parsed = parseCliArguments(process.argv.slice(3));
+  const environmentAccount = process.env.CODEX_CLAUDE_DESIGN_ACCOUNT
+    ? validateAccountName(process.env.CODEX_CLAUDE_DESIGN_ACCOUNT)
+    : undefined;
+  const selectedAccount =
+    parsed.account || environmentAccount || (await configuredDefaultAccount());
   if (command === "server") {
-    await startServer();
+    if (parsed.positional.length || parsed.all || parsed.noOpen) {
+      throw new Error("Usage: claude-design-codex server [--account NAME]");
+    }
+    await startServer({
+      account: selectedAccount,
+      pinned: Boolean(parsed.account || environmentAccount),
+    });
   } else if (command === "login") {
-    await login({ launchBrowser: !process.argv.includes("--no-open") });
+    if (parsed.positional.length || parsed.all) {
+      throw new Error(
+        "Usage: claude-design-codex login [--account NAME] [--no-open]",
+      );
+    }
+    await login({ launchBrowser: !parsed.noOpen, account: selectedAccount });
   } else if (command === "status") {
-    await status();
+    if (
+      parsed.positional.length ||
+      parsed.noOpen ||
+      (parsed.all && parsed.account)
+    ) {
+      throw new Error(
+        "Usage: claude-design-codex status [--account NAME | --all]",
+      );
+    }
+    if (parsed.all) {
+      const profiles = await listAccountProfiles();
+      if (profiles.length === 0) console.log("No Claude Design accounts found.");
+      for (const profile of profiles) {
+        console.log(
+          `${profile.name}${profile.default ? " (default)" : ""}: ${profile.status}`,
+        );
+      }
+    } else {
+      await status(selectedAccount);
+    }
   } else if (command === "logout") {
-    await logout();
+    if (parsed.positional.length || parsed.all || parsed.noOpen) {
+      throw new Error("Usage: claude-design-codex logout [--account NAME]");
+    }
+    await logout(selectedAccount);
+  } else if (command === "accounts") {
+    if (parsed.positional.length || parsed.account || parsed.all || parsed.noOpen) {
+      throw new Error("Usage: claude-design-codex accounts");
+    }
+    const profiles = await listAccountProfiles();
+    if (profiles.length === 0) console.log("No Claude Design accounts found.");
+    for (const profile of profiles) {
+      console.log(
+        `${profile.name}${profile.default ? " (default)" : ""}: ${profile.status}`,
+      );
+    }
+  } else if (command === "default") {
+    if (parsed.account || parsed.all || parsed.noOpen || parsed.positional.length > 1) {
+      throw new Error("Usage: claude-design-codex default [ACCOUNT]");
+    }
+    if (parsed.positional.length === 0) {
+      console.log(await configuredDefaultAccount());
+    } else {
+      const account = await setConfiguredDefaultAccount(parsed.positional[0]);
+      console.log(`Default Claude Design account: ${account}`);
+    }
   } else {
-    throw new Error("Usage: claude-design.mjs [server|login|status|logout]");
+    throw new Error(
+      "Usage: claude-design-codex [server|login|status|logout|accounts|default]",
+    );
   }
 }
 

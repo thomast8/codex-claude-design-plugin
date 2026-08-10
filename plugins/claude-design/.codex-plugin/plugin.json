@@ -1,7 +1,7 @@
 {
   "name": "claude-design",
-  "version": "0.5.0",
-  "description": "Use and export live Claude Design projects and prototypes from Codex through an authenticated local MCP bridge.",
+  "version": "0.6.0",
+  "description": "Use and export live Claude Design projects and prototypes from Codex through a multi-account authenticated local MCP bridge.",
   "author": {
     "name": "Thomas Tiotto"
   },
@@ -17,7 +17,7 @@
   "interface": {
     "displayName": "Claude Design",
     "shortDescription": "Work with and export live Claude Design projects.",
-    "longDescription": "Connects Codex to Anthropic's remote Claude Design MCP through a local bridge, adds exact local file and whole-project export including binary assets, and provides a first-use browser helper for Design's manual-code OAuth flow.",
+    "longDescription": "Connects Codex to Anthropic's remote Claude Design MCP through a local bridge, supports named Claude accounts with per-call, per-session, default, and pinned-instance routing, adds exact local file and whole-project export including binary assets, and provides a browser helper for Design's manual-code OAuth flow.",
     "developerName": "Thomas Tiotto",
     "category": "Design",
     "capabilities": [

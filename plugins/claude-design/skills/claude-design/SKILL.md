@@ -46,19 +46,32 @@ Design projects, designs, prototypes, imports, or exports.
 - Claude Design's OAuth client rejects Codex's standard localhost callback, so
   this plugin uses a local bridge with a one-time manual-code login.
 - On first use, the MCP server opens a loopback browser helper. Ask the user to
-  select **Authorise with Claude**, approve Claude Design in the new tab, copy
-  the short-lived `CODE#STATE` value, and paste it into the local helper page,
-  not into chat.
+  confirm the local profile name, select **Authorise with Claude**, approve
+  Claude Design in the new tab, copy the short-lived `CODE#STATE` value, and
+  paste it into the local helper page, not into chat. Manual login flows allow
+  the profile name to be edited; on-use flows lock the account Codex requested.
 - The helper keeps the PKCE verifier on the local machine and exchanges the
   code directly with Anthropic. It binds only to `127.0.0.1` and times out
   after ten minutes.
-- If a stored refresh token becomes unusable, tell the user to reset the
-  credential through the published `claude-design-codex logout` helper, then
-  retry the request to start a fresh browser flow.
-- Credentials are stored outside the plugin at
-  `~/.config/codex-claude-design/credentials.json` with owner-only permissions.
-  The bridge refreshes an expired access token locally while the refresh token
+- When the user names a Claude account, call `list_accounts` first. Pass its
+  local account name on an individual tool call, or use `set_session_account`
+  when the user wants that route for the rest of the current task.
+- If `set_session_account` is absent, the connector is pinned to one account.
+  Do not try to override the pin; tell the user which account `list_accounts`
+  reports.
+- If a stored refresh token becomes unusable, tell the user to reset only that
+  profile with `claude-design-codex logout --account <name>`, then reconnect it
+  with `login --account <name>`.
+- Credentials are stored outside the plugin under
+  `~/.config/codex-claude-design/accounts/` with one owner-only file per local
+  account name. The legacy `credentials.json` remains the `default` profile.
+  The bridge refreshes each account independently while its refresh token
   remains valid.
+- The local helper lists existing profiles. Its removal flow requires a second
+  confirmation and deletes only the chosen local credential file, never the
+  Claude account or remote projects.
+- Never infer that a local profile name matches the Claude account used during
+  OAuth. Ask the user to check the active browser account during login.
 - After login, retry a read-only `list_projects` call before continuing.
 - Never request or display an OAuth access or refresh token.
 
