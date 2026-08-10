@@ -1,6 +1,6 @@
 {
   "name": "claude-design",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Use and export live Claude Design projects and prototypes with capability-aware design-system guidance through a multi-account authenticated local MCP bridge.",
   "author": {
     "name": "Thomas Tiotto"

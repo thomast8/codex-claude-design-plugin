@@ -13,11 +13,12 @@ layer: templates, components, tokens, styles, assets, or written guidance. It
 does not treat binding, copying, or loading a design system as proof that the
 deliverable uses it.
 
-For native-agent delegation, the skill can copy a complete execution brief into
-a project chat with `put_conversation` and return the project link and chat
-title. The user then types `Go` and presses Enter in Claude Design. Importing a
-chat does not itself run Claude or fill the composer, so the skill verifies the
-subsequent conversation and project changes before reporting execution.
+For native-agent delegation, the skill can give a complete execution brief to
+an authenticated Claude Code agent running the Design MCP bridge. If Claude
+Code is unavailable or logged out, it writes `CODEX_HANDOFF.md` into the
+project and directs the user to execute it from a fresh Claude Design chat.
+Synced chats created by `put_conversation` are read-only in the web app, so the
+skill treats them only as audit transcripts and never as an execution path.
 
 ## Why the bridge is required
 

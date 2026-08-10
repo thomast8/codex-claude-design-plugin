@@ -1,6 +1,6 @@
 {
   "name": "claude-design-codex",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "description": "Authentication helper for the Claude Design Codex plugin.",
   "type": "module",

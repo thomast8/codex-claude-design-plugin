@@ -320,7 +320,7 @@ async function requestTokens(body, label) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "User-Agent": "codex-claude-design/0.6.1",
+      "User-Agent": "codex-claude-design/0.6.2",
     },
     body: JSON.stringify(body),
   });
@@ -922,7 +922,7 @@ async function readProjectTextFile(callRemoteTool, projectId, file) {
 async function fetchProjectAsset(url, expectedSize) {
   const response = await fetch(url, {
     redirect: "error",
-    headers: { "User-Agent": "codex-claude-design/0.6.1" },
+    headers: { "User-Agent": "codex-claude-design/0.6.2" },
   });
   if (!response.ok) {
     throw new Error(`Project file download failed (${response.status}).`);
