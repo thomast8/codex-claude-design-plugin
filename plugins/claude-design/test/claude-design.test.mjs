@@ -140,6 +140,18 @@ test("bridge publishes export and account routing tools", () => {
   );
 });
 
+test("skill keeps native-agent handoff distinct from conversation import", async () => {
+  const skill = await readFile(
+    new URL("../skills/claude-design/SKILL.md", import.meta.url),
+    "utf8",
+  );
+  assert.match(skill, /`put_conversation` copies messages into a project chat/);
+  assert.match(skill, /It does not run\s+Claude/);
+  assert.match(skill, /type `Go`, and press Enter/);
+  assert.match(skill, /`put_conversation` leaves the composer untouched/);
+  assert.match(skill, /use `get_conversation` and project source\s+readback/);
+});
+
 test("named accounts use isolated credential files", async () => {
   await saveStore(
     {
