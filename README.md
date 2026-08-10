@@ -44,6 +44,34 @@ The bridge adds two local tools to Anthropic's MCP surface:
 Both tools require a new absolute destination under the user's home or
 temporary directory and refuse to overwrite existing paths.
 
+## Design-system behaviour
+
+When a design system, UI kit, brand system, or existing product context applies,
+the plugin guides Codex to inspect the capabilities that are actually available
+and reuse the strongest suitable layer: templates, components, tokens, styles,
+assets, or written guidance. It does not force component reuse when a system is
+token-only, nor does it add design-system work to unrelated designs.
+
+Before handoff, Codex verifies that declared resources are actually referenced
+and distinguishes system binding or loading from real use. It reports reused
+and adapted resources, justified exceptions, functional QA, and visual
+consistency separately.
+
+## Hand work to Claude Design
+
+For design-heavy work, Codex can prepare a self-contained brief and copy it
+into the target project's chat with Claude Design's `put_conversation` tool.
+It then returns the project link and imported chat title so the user can open
+the chat, type `Go`, and press Enter. Claude Design keeps the project, design
+system, and visual iteration context while its native Claude agent does the
+generation work; Codex can review the resulting source and preview afterwards.
+
+This is currently a human-triggered handoff. The supported MCP surface does not
+publish a tool that submits a prompt to Claude Design's native agent, and
+`put_conversation` leaves the chat composer empty. The plugin therefore never
+equates importing the brief with running it, and does not promise that pressing
+Enter on an empty composer will execute the task.
+
 ## Multiple Claude accounts
 
 Give each Claude account a short local name when you connect it. The local

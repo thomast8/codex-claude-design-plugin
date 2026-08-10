@@ -7,6 +7,18 @@ Explicit Claude Design requests stay on this connector. The bridge adds exact
 raw `download_file_to_local` and complete `export_project_to_local` tools so
 binary assets and standalone local bundles do not require browser fallback.
 
+When design-system context applies, the bundled skill tells Codex to inspect
+the capabilities that are actually present and use the strongest suitable
+layer: templates, components, tokens, styles, assets, or written guidance. It
+does not treat binding, copying, or loading a design system as proof that the
+deliverable uses it.
+
+For native-agent delegation, the skill can copy a complete execution brief into
+a project chat with `put_conversation` and return the project link and chat
+title. The user then types `Go` and presses Enter in Claude Design. Importing a
+chat does not itself run Claude or fill the composer, so the skill verifies the
+subsequent conversation and project changes before reporting execution.
+
 ## Why the bridge is required
 
 Anthropic's dedicated Claude Design OAuth client uses a manual-code callback.
